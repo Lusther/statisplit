@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
 from xml.etree import ElementTree
 
 import altair as alt
@@ -53,11 +53,13 @@ def format_time_lss(td: timedelta) -> str:
 # XML parsing
 # ---------------------------------------------------------------------------
 
-def parse_lss(file_bytes: bytes) -> tuple[dict, list[dict]]:
-    """Parse a .lss file and return (run_info, segments).
+def parse_lss(file_bytes: bytes) -> tuple[dict, list[dict], list[dict]]:
+    """Parse a .lss file and return (run_info, segments, attempt_history).
 
     run_info: dict with keys 'game', 'category', 'attempts'
     segments: list of dicts with keys 'name', 'pb_split', 'best_segment'
+    attempt_history: list of dicts with keys 'id', 'started', 'real_time'
+        (only completed attempts — those with a RealTime child)
     """
     root = ElementTree.fromstring(file_bytes)
 
@@ -105,7 +107,29 @@ def parse_lss(file_bytes: bytes) -> tuple[dict, list[dict]]:
             "history": history,
         })
 
-    return run_info, segments
+    # --- AttemptHistory (completed runs only) ---
+    attempt_history: list[dict] = []
+    ah_el = root.find("AttemptHistory")
+    if ah_el is not None:
+        for attempt_el in ah_el.findall("Attempt"):
+            real_time = parse_time(attempt_el.findtext("RealTime"))
+            if real_time is None:
+                continue
+            attempt_id = int(attempt_el.get("id", "0"))
+            started_str = attempt_el.get("started", "")
+            started_dt = None
+            if started_str:
+                try:
+                    started_dt = datetime.strptime(started_str, "%m/%d/%Y %H:%M:%S")
+                except ValueError:
+                    started_dt = None
+            attempt_history.append({
+                "id": attempt_id,
+                "started": started_dt,
+                "real_time": real_time,
+            })
+
+    return run_info, segments, attempt_history
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +178,42 @@ def rank_splits_for_training(hist_df: pd.DataFrame) -> pd.DataFrame | None:
     stats = stats.drop(columns=["Mean (s)"])
     stats = stats.sort_values(by="CV (%)", ascending=False)
     return stats
+
+
+def build_pb_progression(attempt_history: list[dict]) -> pd.DataFrame:
+    """Compute PB progression from completed attempt history.
+
+    Parameters
+    ----------
+    attempt_history : list of dicts with keys 'id', 'started', 'real_time'
+        Only completed attempts (from parse_lss).
+
+    Returns
+    -------
+    DataFrame with columns: Attempt, Date, Time (s), PB (s), Is New PB.
+    Empty DataFrame if no attempts.
+    """
+    if not attempt_history:
+        return pd.DataFrame()
+
+    sorted_attempts = sorted(attempt_history, key=lambda a: a["id"])
+
+    rows: list[dict] = []
+    running_pb = float('inf')
+    for attempt in sorted_attempts:
+        time_s = attempt["real_time"].total_seconds()
+        is_new_pb = time_s < running_pb
+        pb_s = min(running_pb, time_s)
+        running_pb = pb_s
+        rows.append({
+            "Attempt": attempt["id"],
+            "Date": attempt["started"],
+            "Time (s)": time_s,
+            "PB (s)": pb_s,
+            "Is New PB": is_new_pb,
+        })
+
+    return pd.DataFrame(rows)
 
 
 def build_history_df(segments: list[dict], n_attempts: int) -> pd.DataFrame:
@@ -301,7 +361,7 @@ uploaded = st.file_uploader("Upload a .lss file", type=["lss"])
 
 if uploaded is not None:
     try:
-        run_info, segments = parse_lss(uploaded.getvalue())
+        run_info, segments, attempt_history = parse_lss(uploaded.getvalue())
     except ElementTree.ParseError:
         st.error("Failed to parse the uploaded file. Make sure it is a valid .lss (XML) file.")
         st.stop()
@@ -446,3 +506,59 @@ if uploaded is not None:
                     file_name=f"{base_name}_balanced.lss",
                     mime="application/xml",
                 )
+
+    # ------------------------------------------------------------------
+    # PB Progression
+    # ------------------------------------------------------------------
+    if attempt_history:
+        pb_df = build_pb_progression(attempt_history)
+
+        if not pb_df.empty and pb_df["Is New PB"].any():
+            st.subheader("PB Progression")
+
+            pb_points = pb_df[pb_df["Is New PB"]].copy()
+            has_dates = pb_points["Date"].notna().all()
+
+            if has_dates:
+                x_axis_option = st.radio(
+                    "X-axis",
+                    ["Date", "Attempt #"],
+                    horizontal=True,
+                    key="pb_x_axis",
+                )
+            else:
+                x_axis_option = "Attempt #"
+
+            pb_points["PB"] = pb_points["PB (s)"].apply(
+                lambda s: format_time(timedelta(seconds=s))
+            )
+
+            if x_axis_option == "Date":
+                x_encode = alt.X("Date:T", title="Date")
+            else:
+                x_encode = alt.X("Attempt:Q", title="Attempt #")
+
+            chart = alt.Chart(pb_points).mark_line(
+                point=True,
+                interpolate="step-after",
+            ).encode(
+                x=x_encode,
+                y=alt.Y("PB (s):Q", title="PB Time (seconds)", scale=alt.Scale(zero=False)),
+                tooltip=[
+                    alt.Tooltip("Attempt:Q", title="Attempt"),
+                    alt.Tooltip("PB:N", title="PB Time"),
+                    alt.Tooltip("Date:T", title="Date"),
+                ],
+            )
+
+            st.altair_chart(chart, use_container_width=True)
+
+            first_pb = pb_points.iloc[0]["PB (s)"]
+            current_pb = pb_points.iloc[-1]["PB (s)"]
+            improvement = first_pb - current_pb
+            st.caption(
+                f"PBs set: {len(pb_points)} | "
+                f"First completed: {format_time(timedelta(seconds=first_pb))} | "
+                f"Current PB: {format_time(timedelta(seconds=current_pb))} | "
+                f"Total improvement: {format_time(timedelta(seconds=improvement))}"
+            )
