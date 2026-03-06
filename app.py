@@ -53,13 +53,15 @@ def format_time_lss(td: timedelta) -> str:
 # XML parsing
 # ---------------------------------------------------------------------------
 
-def parse_lss(file_bytes: bytes) -> tuple[dict, list[dict], list[dict]]:
-    """Parse a .lss file and return (run_info, segments, attempt_history).
+def parse_lss(file_bytes: bytes) -> tuple[dict, list[dict], list[dict], list[dict]]:
+    """Parse a .lss file and return (run_info, segments, attempt_history, all_attempts).
 
     run_info: dict with keys 'game', 'category', 'attempts'
     segments: list of dicts with keys 'name', 'pb_split', 'best_segment'
     attempt_history: list of dicts with keys 'id', 'started', 'real_time'
         (only completed attempts — those with a RealTime child)
+    all_attempts: list of dicts with keys 'id', 'started', 'completed'
+        (every attempt — completed flag is True when RealTime exists)
     """
     root = ElementTree.fromstring(file_bytes)
 
@@ -107,14 +109,12 @@ def parse_lss(file_bytes: bytes) -> tuple[dict, list[dict], list[dict]]:
             "history": history,
         })
 
-    # --- AttemptHistory (completed runs only) ---
-    attempt_history: list[dict] = []
+    # --- AttemptHistory ---
+    attempt_history: list[dict] = []   # completed only (backward compat)
+    all_attempts: list[dict] = []      # every attempt
     ah_el = root.find("AttemptHistory")
     if ah_el is not None:
         for attempt_el in ah_el.findall("Attempt"):
-            real_time = parse_time(attempt_el.findtext("RealTime"))
-            if real_time is None:
-                continue
             attempt_id = int(attempt_el.get("id", "0"))
             started_str = attempt_el.get("started", "")
             started_dt = None
@@ -123,13 +123,24 @@ def parse_lss(file_bytes: bytes) -> tuple[dict, list[dict], list[dict]]:
                     started_dt = datetime.strptime(started_str, "%m/%d/%Y %H:%M:%S")
                 except ValueError:
                     started_dt = None
-            attempt_history.append({
+
+            real_time = parse_time(attempt_el.findtext("RealTime"))
+            completed = real_time is not None
+
+            all_attempts.append({
                 "id": attempt_id,
                 "started": started_dt,
-                "real_time": real_time,
+                "completed": completed,
             })
 
-    return run_info, segments, attempt_history
+            if completed:
+                attempt_history.append({
+                    "id": attempt_id,
+                    "started": started_dt,
+                    "real_time": real_time,
+                })
+
+    return run_info, segments, attempt_history, all_attempts
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +248,78 @@ def build_history_df(segments: list[dict], n_attempts: int) -> pd.DataFrame:
                 })
 
     return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Reset analysis helpers
+# ---------------------------------------------------------------------------
+
+def find_reset_locations(
+    segments: list[dict], all_attempts: list[dict],
+) -> pd.DataFrame:
+    """Identify where each reset happened by segment.
+
+    For every incomplete attempt, find the last segment that recorded a
+    SegmentHistory entry for that attempt ID — that's the reset point.
+    Attempts with zero segment history entries are mapped to the first segment
+    (the runner was on it but never completed it).
+
+    Returns a DataFrame with columns: attempt_id, reset_segment.
+    """
+    incomplete_ids = {a["id"] for a in all_attempts if not a["completed"]}
+    if not incomplete_ids:
+        return pd.DataFrame(columns=["attempt_id", "reset_segment"])
+
+    first_segment_name = segments[0]["name"] if segments else "Unknown"
+
+    # Build a mapping: attempt_id → last segment name seen
+    last_seg_for_attempt: dict[int, str] = {}
+    for seg in segments:
+        for h in seg["history"]:
+            aid = h["attempt_id"]
+            if aid in incomplete_ids:
+                last_seg_for_attempt[aid] = seg["name"]
+
+    rows: list[dict] = []
+    for aid in sorted(incomplete_ids):
+        rows.append({
+            "attempt_id": aid,
+            "reset_segment": last_seg_for_attempt.get(aid, first_segment_name),
+        })
+    return pd.DataFrame(rows)
+
+
+def build_completion_trend(
+    all_attempts: list[dict], window_size: int,
+) -> pd.DataFrame:
+    """Compute a rolling completion rate over sorted attempts.
+
+    Returns a DataFrame with columns: Attempt, Completion Rate (%).
+    """
+    sorted_attempts = sorted(all_attempts, key=lambda a: a["id"])
+    completed_flags = [1 if a["completed"] else 0 for a in sorted_attempts]
+    ids = [a["id"] for a in sorted_attempts]
+
+    s = pd.Series(completed_flags)
+    rolling = s.rolling(window=window_size, min_periods=1).mean() * 100
+
+    return pd.DataFrame({
+        "Attempt": ids,
+        "Completion Rate (%)": rolling.values,
+    })
+
+
+def compute_reset_streaks(all_attempts: list[dict]) -> tuple[int, int]:
+    """Return (longest_reset_streak, current_reset_streak)."""
+    running_streak = 0
+    longest_streak = 0
+    for attempt in all_attempts:
+        if not attempt["completed"]:
+            running_streak += 1
+            longest_streak = max(longest_streak, running_streak)
+        else:
+            running_streak = 0
+    return longest_streak, running_streak
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +444,7 @@ uploaded = st.file_uploader("Upload a .lss file", type=["lss"])
 
 if uploaded is not None:
     try:
-        run_info, segments, attempt_history = parse_lss(uploaded.getvalue())
+        run_info, segments, attempt_history, all_attempts = parse_lss(uploaded.getvalue())
     except ElementTree.ParseError:
         st.error("Failed to parse the uploaded file. Make sure it is a valid .lss (XML) file.")
         st.stop()
@@ -425,6 +508,91 @@ if uploaded is not None:
                 )
         else:
             st.info("No segment history data available for the selected attempts.")
+
+    # ------------------------------------------------------------------
+    # Reset Analysis
+    # ------------------------------------------------------------------
+    if all_attempts and len(all_attempts) >= 2:
+        st.subheader("Reset Analysis")
+
+        total_count = len(all_attempts)
+        completed_count = sum(1 for a in all_attempts if a["completed"])
+        reset_count = total_count - completed_count
+        completion_pct = (completed_count / total_count) * 100 if total_count else 0
+        reset_pct = 100 - completion_pct
+
+        # KPI row
+        kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+        kpi1.metric("Total Attempts", total_count)
+        kpi2.metric("Completed", completed_count)
+        kpi3.metric("Completion Rate", f"{completion_pct:.1f}%")
+        kpi4.metric("Reset Rate", f"{reset_pct:.1f}%")
+
+        # Streak row
+        streaks = compute_reset_streaks(all_attempts)
+        if streaks is not None:
+            longest_streak, current_streak = streaks
+            s1, s2 = st.columns(2)
+            s1.metric("Longest Reset Streak", longest_streak)
+            s2.metric("Current Reset Streak", current_streak)
+
+        # Reset location bar chart
+        reset_df = find_reset_locations(segments, all_attempts)
+        if not reset_df.empty:
+            segment_order = [seg["name"] for seg in segments]
+            reset_counts = reset_df.groupby("reset_segment").size().reset_index(name="Resets")
+            reset_counts.columns = ["Segment", "Resets"]
+
+            reset_mode = st.toggle("Show as Reset Chance (%)", key="reset_chart_mode")
+
+            if reset_mode:
+                # Times played = completed runs + resets at this segment or later
+                seg_index = {name: i for i, name in enumerate(segment_order)}
+                resets_by_idx = {seg_index[row["Segment"]]: row["Resets"]
+                                 for _, row in reset_counts.iterrows()
+                                 if row["Segment"] in seg_index}
+                chart_rows = []
+                # Cumulative resets from the end: segments at index >= i
+                resets_at_or_after = 0
+                for i in range(len(segment_order) - 1, -1, -1):
+                    resets_at_or_after += resets_by_idx.get(i, 0)
+                    times_played = completed_count + resets_at_or_after
+                    seg_resets = resets_by_idx.get(i, 0)
+                    chance = (seg_resets / times_played) * 100 if times_played else 0
+                    chart_rows.append({
+                        "Segment": segment_order[i],
+                        "Reset Chance (%)": round(chance, 1),
+                    })
+                chart_df = pd.DataFrame(chart_rows)
+                reset_chart = alt.Chart(chart_df).mark_bar().encode(
+                    x=alt.X("Segment:N", sort=segment_order, title="Segment"),
+                    y=alt.Y("Reset Chance (%):Q", title="Reset Chance (%)"),
+                    tooltip=["Segment", "Reset Chance (%)"],
+                )
+            else:
+                reset_chart = alt.Chart(reset_counts).mark_bar().encode(
+                    x=alt.X("Segment:N", sort=segment_order, title="Segment"),
+                    y=alt.Y("Resets:Q", title="Reset Count"),
+                    tooltip=["Segment", "Resets"],
+                )
+
+            st.altair_chart(reset_chart, use_container_width=True)
+
+        # Completion rate trend
+        window = st.slider(
+            "Rolling window size",
+            min_value=5,
+            max_value=max(10, total_count),
+            value=min(20, total_count),
+            key="reset_window",
+        )
+        trend_df = build_completion_trend(all_attempts, window)
+        trend_chart = alt.Chart(trend_df).mark_line().encode(
+            x=alt.X("Attempt:Q", title="Attempt #"),
+            y=alt.Y("Completion Rate (%):Q", scale=alt.Scale(domain=[0, 100])),
+            tooltip=["Attempt", "Completion Rate (%)"],
+        )
+        st.altair_chart(trend_chart, use_container_width=True)
 
     # ------------------------------------------------------------------
     # Balanced Time Goal
