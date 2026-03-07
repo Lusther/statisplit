@@ -324,8 +324,9 @@ def find_reset_locations(
 ) -> pd.DataFrame:
     """Identify where each reset happened by segment.
 
-    For every incomplete attempt, find the last segment that recorded a
-    SegmentHistory entry for that attempt ID — that's the reset point.
+    For every incomplete attempt, find the segment the runner was on when
+    they reset.  This is the segment *after* the last one with a completed
+    SegmentHistory entry (since that entry means the split was passed).
     Attempts with zero segment history entries are mapped to the first segment
     (the runner was on it but never completed it).
 
@@ -336,20 +337,32 @@ def find_reset_locations(
         return pd.DataFrame(columns=["attempt_id", "reset_segment"])
 
     first_segment_name = segments[0]["name"] if segments else "Unknown"
+    last_segment_name = segments[-1]["name"] if segments else "Unknown"
+    seg_index = {seg["name"]: i for i, seg in enumerate(segments)}
 
-    # Build a mapping: attempt_id → last segment name seen
-    last_seg_for_attempt: dict[int, str] = {}
+    # Build a mapping: attempt_id → index of last completed segment
+    last_completed_idx: dict[int, int] = {}
     for seg in segments:
         for h in seg["history"]:
             aid = h["attempt_id"]
             if aid in incomplete_ids:
-                last_seg_for_attempt[aid] = seg["name"]
+                last_completed_idx[aid] = seg_index[seg["name"]]
 
     rows: list[dict] = []
     for aid in sorted(incomplete_ids):
+        if aid not in last_completed_idx:
+            # No segment completed — reset happened on the first segment
+            reset_seg = first_segment_name
+        else:
+            next_idx = last_completed_idx[aid] + 1
+            if next_idx < len(segments):
+                reset_seg = segments[next_idx]["name"]
+            else:
+                # Completed all segments but still marked incomplete (edge case)
+                reset_seg = last_segment_name
         rows.append({
             "attempt_id": aid,
-            "reset_segment": last_seg_for_attempt.get(aid, first_segment_name),
+            "reset_segment": reset_seg,
         })
     return pd.DataFrame(rows)
 
