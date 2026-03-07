@@ -227,6 +227,71 @@ def build_pb_progression(attempt_history: list[dict]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def build_sob_progression(segments: list[dict]) -> pd.DataFrame:
+    """Compute Sum of Best progression across all attempts.
+
+    For each attempt (in chronological order), update the running best
+    duration for every segment that recorded a time in that attempt,
+    then compute SOB = sum of all per-segment bests.  SOB is only valid
+    once every segment has been seen at least once.
+
+    Parameters
+    ----------
+    segments : list of segment dicts from parse_lss (each has 'name',
+               'best_segment', and 'history' with attempt_id/duration).
+
+    Returns
+    -------
+    DataFrame with columns: Attempt, SOB (s), Is New SOB.
+    Empty DataFrame if not enough data.
+    """
+    if not segments:
+        return pd.DataFrame()
+
+    seg_names = [seg["name"] for seg in segments]
+    n_segments = len(seg_names)
+
+    # Build a lookup: attempt_id -> {segment_name: duration_seconds}
+    attempt_segments: dict[int, dict[str, float]] = {}
+    for seg in segments:
+        for h in seg["history"]:
+            aid = h["attempt_id"]
+            if aid not in attempt_segments:
+                attempt_segments[aid] = {}
+            attempt_segments[aid][seg["name"]] = h["duration"].total_seconds()
+
+    if not attempt_segments:
+        return pd.DataFrame()
+
+    sorted_attempt_ids = sorted(attempt_segments.keys())
+
+    rows: list[dict] = []
+
+    running_best_segments: dict[str, float] = {seg: float('inf') for seg in seg_names}
+    running_sob = float('inf')
+
+    for aid in sorted_attempt_ids:
+        seg_times = attempt_segments[aid]
+        
+        # Update running bests for segments seen in this attempt
+        for seg in seg_names:
+            if seg in seg_times:
+                running_best_segments[seg] = min(seg_times[seg], running_best_segments[seg])
+
+        # Check if we have a valid SOB (all segments have a best)
+        if float('inf') not in running_best_segments.values() :
+            sob = sum(running_best_segments[seg] for seg in seg_names)
+            is_new_sob = sob < running_sob
+            running_sob = min(running_sob, sob)
+            rows.append({
+                "Attempt": aid,
+                "SOB (s)": sob,
+                "Is New SOB": is_new_sob,
+            })
+
+    return pd.DataFrame(rows)
+
+
 def build_history_df(segments: list[dict], n_attempts: int) -> pd.DataFrame:
     """Build a DataFrame of segment durations from the last *n_attempts* attempts."""
     rows: list[dict] = []
@@ -676,57 +741,92 @@ if uploaded is not None:
                 )
 
     # ------------------------------------------------------------------
-    # PB Progression
+    # PB & Sum of Best Progression
     # ------------------------------------------------------------------
-    if attempt_history:
-        pb_df = build_pb_progression(attempt_history)
+    pb_df = build_pb_progression(attempt_history) if attempt_history else pd.DataFrame()
+    sob_df = build_sob_progression(segments)
 
-        if not pb_df.empty and pb_df["Is New PB"].any():
-            st.subheader("PB Progression")
+    has_pb = not pb_df.empty and pb_df["Is New PB"].any()
+    has_sob = not sob_df.empty and sob_df["Is New SOB"].any()
 
+    if has_pb or has_sob:
+        st.subheader("PB & Sum of Best Progression")
+
+        combined_rows: list[pd.DataFrame] = []
+
+        if has_pb:
             pb_points = pb_df[pb_df["Is New PB"]].copy()
-            has_dates = pb_points["Date"].notna().all()
+            combined_rows.append(pd.DataFrame({
+                "Attempt": pb_points["Attempt"],
+                "Time (s)": pb_points["PB (s)"],
+                "Formatted": pb_points["PB (s)"].apply(
+                    lambda s: format_time(timedelta(seconds=s))
+                ),
+                "Series": "PB",
+            }))
 
-            if has_dates:
-                x_axis_option = st.radio(
-                    "X-axis",
-                    ["Date", "Attempt #"],
-                    horizontal=True,
-                    key="pb_x_axis",
-                )
-            else:
-                x_axis_option = "Attempt #"
+        if has_sob:
+            sob_points = sob_df[sob_df["Is New SOB"]].copy()
+            combined_rows.append(pd.DataFrame({
+                "Attempt": sob_points["Attempt"],
+                "Time (s)": sob_points["SOB (s)"],
+                "Formatted": sob_points["SOB (s)"].apply(
+                    lambda s: format_time(timedelta(seconds=s))
+                ),
+                "Series": "SOB",
+            }))
 
-            pb_points["PB"] = pb_points["PB (s)"].apply(
-                lambda s: format_time(timedelta(seconds=s))
+        combined = pd.concat(combined_rows, ignore_index=True)
+
+        min_attempt = int(combined["Attempt"].min())
+        max_attempt = int(combined["Attempt"].max())
+
+        if max_attempt - min_attempt > 1:
+            attempt_range = st.slider(
+                "Attempt range",
+                min_value=min_attempt,
+                max_value=max_attempt,
+                value=(min_attempt, max_attempt),
+                key="progression_attempt_range",
             )
+            combined = combined[
+                (combined["Attempt"] >= attempt_range[0])
+                & (combined["Attempt"] <= attempt_range[1])
+            ]
 
-            if x_axis_option == "Date":
-                x_encode = alt.X("Date:T", title="Date")
-            else:
-                x_encode = alt.X("Attempt:Q", title="Attempt #")
+        chart = alt.Chart(combined).mark_line(
+            point=True,
+            interpolate="step-after",
+        ).encode(
+            x=alt.X("Attempt:Q", title="Attempt #"),
+            y=alt.Y("Time (s):Q", title="Time (seconds)", scale=alt.Scale(zero=False)),
+            color=alt.Color("Series:N", title="Series"),
+            tooltip=[
+                alt.Tooltip("Attempt:Q", title="Attempt"),
+                alt.Tooltip("Formatted:N", title="Time"),
+                alt.Tooltip("Series:N", title="Series"),
+            ],
+        )
 
-            chart = alt.Chart(pb_points).mark_line(
-                point=True,
-                interpolate="step-after",
-            ).encode(
-                x=x_encode,
-                y=alt.Y("PB (s):Q", title="PB Time (seconds)", scale=alt.Scale(zero=False)),
-                tooltip=[
-                    alt.Tooltip("Attempt:Q", title="Attempt"),
-                    alt.Tooltip("PB:N", title="PB Time"),
-                    alt.Tooltip("Date:T", title="Date"),
-                ],
+        st.altair_chart(chart, use_container_width=True)
+
+        caption_parts: list[str] = []
+        if has_pb:
+            pb_pts = pb_df[pb_df["Is New PB"]]
+            first_pb = pb_pts.iloc[0]["PB (s)"]
+            current_pb = pb_pts.iloc[-1]["PB (s)"]
+            caption_parts.append(
+                f"PB: {format_time(timedelta(seconds=current_pb))} "
+                f"({len(pb_pts)} PBs, "
+                f"{format_time(timedelta(seconds=first_pb - current_pb))} improvement)"
             )
-
-            st.altair_chart(chart, use_container_width=True)
-
-            first_pb = pb_points.iloc[0]["PB (s)"]
-            current_pb = pb_points.iloc[-1]["PB (s)"]
-            improvement = first_pb - current_pb
-            st.caption(
-                f"PBs set: {len(pb_points)} | "
-                f"First completed: {format_time(timedelta(seconds=first_pb))} | "
-                f"Current PB: {format_time(timedelta(seconds=current_pb))} | "
-                f"Total improvement: {format_time(timedelta(seconds=improvement))}"
+        if has_sob:
+            sob_pts = sob_df[sob_df["Is New SOB"]]
+            first_sob = sob_pts.iloc[0]["SOB (s)"]
+            current_sob = sob_pts.iloc[-1]["SOB (s)"]
+            caption_parts.append(
+                f"SOB: {format_time(timedelta(seconds=current_sob))} "
+                f"({len(sob_pts)} improvements, "
+                f"{format_time(timedelta(seconds=first_sob - current_sob))} improvement)"
             )
+        st.caption(" | ".join(caption_parts))
