@@ -642,17 +642,21 @@ if uploaded is not None:
                         "Reset Chance (%)": round(chance, 1),
                     })
                 chart_df = pd.DataFrame(chart_rows)
+                hover = alt.selection_point(on="pointerover", empty=False)
                 reset_chart = alt.Chart(chart_df).mark_bar().encode(
                     x=alt.X("Segment:N", sort=segment_order, title="Segment"),
                     y=alt.Y("Reset Chance (%):Q", title="Reset Chance (%)"),
                     tooltip=["Segment", "Reset Chance (%)"],
-                )
+                    opacity=alt.condition(hover, alt.value(1), alt.value(0.7)),
+                ).add_params(hover)
             else:
+                hover = alt.selection_point(on="pointerover", empty=False)
                 reset_chart = alt.Chart(reset_counts).mark_bar().encode(
                     x=alt.X("Segment:N", sort=segment_order, title="Segment"),
                     y=alt.Y("Resets:Q", title="Reset Count"),
                     tooltip=["Segment", "Resets"],
-                )
+                    opacity=alt.condition(hover, alt.value(1), alt.value(0.7)),
+                ).add_params(hover)
 
             st.altair_chart(reset_chart, use_container_width=True)
 
@@ -665,11 +669,11 @@ if uploaded is not None:
             key="reset_window",
         )
         trend_df = build_completion_trend(all_attempts, window)
-        trend_chart = alt.Chart(trend_df).mark_line().encode(
+        trend_chart = alt.Chart(trend_df).mark_line(point=True).encode(
             x=alt.X("Attempt:Q", title="Attempt #"),
             y=alt.Y("Completion Rate (%):Q", scale=alt.Scale(domain=[0, 100])),
             tooltip=["Attempt", "Completion Rate (%)"],
-        )
+        ).interactive()
         st.altair_chart(trend_chart, use_container_width=True)
 
     # ------------------------------------------------------------------
@@ -819,7 +823,7 @@ if uploaded is not None:
                 alt.Tooltip("Formatted:N", title="Time"),
                 alt.Tooltip("Series:N", title="Series"),
             ],
-        )
+        ).interactive()
 
         st.altair_chart(chart, use_container_width=True)
 
