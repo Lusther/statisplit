@@ -401,6 +401,248 @@ def compute_reset_streaks(all_attempts: list[dict]) -> tuple[int, int]:
 
 
 # ---------------------------------------------------------------------------
+# Session analysis helpers
+# ---------------------------------------------------------------------------
+
+def group_attempts_into_sessions(
+    all_attempts: list[dict],
+    attempt_history: list[dict],
+    mode: str,
+    gap_minutes: int = 60,
+) -> list[dict]:
+    """Group attempts into sessions by time gap or calendar boundary.
+
+    Parameters
+    ----------
+    all_attempts : every attempt (with 'id', 'started', 'completed')
+    attempt_history : completed attempts (with 'id', 'started', 'real_time')
+    mode : one of 'Session', 'Day', 'Week', 'Month', 'Year'
+    gap_minutes : gap threshold for session mode
+
+    Returns
+    -------
+    List of session dicts sorted chronologically:
+        {label, attempt_ids, all_attempts, completed_attempts, first_start, last_start}
+    """
+    completed_lookup = {a["id"]: a for a in attempt_history}
+
+    # Filter to attempts with valid timestamps and sort
+    timed = [a for a in all_attempts if a["started"] is not None]
+    timed.sort(key=lambda a: a["started"])
+    if not timed:
+        return []
+
+    def calendar_key(dt: datetime) -> str:
+        if mode == "Day":
+            return dt.strftime("%Y-%m-%d")
+        elif mode == "Week":
+            iso = dt.isocalendar()
+            return f"{iso[0]}-W{iso[1]:02d}"
+        elif mode == "Month":
+            return dt.strftime("%Y-%m")
+        elif mode == "Year":
+            return str(dt.year)
+        return ""
+
+    # Build groups
+    groups: list[list[dict]] = []
+    if mode == "Session":
+        current_group: list[dict] = [timed[0]]
+        for prev, cur in zip(timed, timed[1:]):
+            gap = (cur["started"] - prev["started"]).total_seconds() / 60
+            if gap > gap_minutes:
+                groups.append(current_group)
+                current_group = [cur]
+            else:
+                current_group.append(cur)
+        groups.append(current_group)
+    else:
+        bucket: dict[str, list[dict]] = {}
+        for a in timed:
+            key = calendar_key(a["started"])
+            bucket.setdefault(key, []).append(a)
+        for key in sorted(bucket):
+            groups.append(bucket[key])
+
+    # Convert to session dicts
+    sessions: list[dict] = []
+    for i, group in enumerate(groups):
+        ids = [a["id"] for a in group]
+        completed = [completed_lookup[aid] for aid in ids if aid in completed_lookup]
+        first = group[0]["started"]
+        last = group[-1]["started"]
+        if mode == "Session":
+            label = f"Session {i + 1} ({first.strftime('%b %d %H:%M')})"
+        else:
+            label = calendar_key(first)
+        sessions.append({
+            "label": label,
+            "attempt_ids": ids,
+            "all_attempts": group,
+            "completed_attempts": completed,
+            "first_start": first,
+            "last_start": last,
+        })
+    return sessions
+
+
+def compute_session_kpis(session: dict, segments: list[dict]) -> dict:
+    """Compute KPIs for a single session.
+
+    Returns dict with: num_attempts, num_completed, reset_rate_pct,
+    best_time, avg_completed_time, median_completed_time,
+    time_spent, furthest_segment, pbs_achieved.
+    """
+    n = len(session["all_attempts"])
+    completed = session["completed_attempts"]
+    nc = len(completed)
+    reset_rate = ((n - nc) / n) * 100 if n else 0
+
+    times = sorted([c["real_time"].total_seconds() for c in completed])
+    best = timedelta(seconds=times[0]) if times else None
+    avg = timedelta(seconds=sum(times) / len(times)) if times else None
+    median_val = None
+    if times:
+        mid = len(times) // 2
+        median_s = times[mid] if len(times) % 2 == 1 else (times[mid - 1] + times[mid]) / 2
+        median_val = timedelta(seconds=median_s)
+
+    # Time spent = sum of actual run durations
+    # Completed attempts: use real_time; incomplete: sum segment history
+    attempt_ids = set(session["attempt_ids"])
+    completed_ids = {c["id"] for c in completed}
+    time_spent_s = sum(times)  # completed run times already in `times`
+    for seg in segments:
+        for h in seg["history"]:
+            if h["attempt_id"] in attempt_ids and h["attempt_id"] not in completed_ids:
+                time_spent_s += h["duration"].total_seconds()
+    time_spent = timedelta(seconds=time_spent_s)
+
+    # Furthest segment reached (for sessions with no completions)
+    furthest = None
+    if nc == 0:
+        seg_index = {seg["name"]: i for i, seg in enumerate(segments)}
+        max_idx = -1
+        for seg in segments:
+            for h in seg["history"]:
+                if h["attempt_id"] in attempt_ids:
+                    max_idx = max(max_idx, seg_index[seg["name"]])
+        if max_idx >= 0:
+            furthest = segments[max_idx]["name"]
+
+    # Count PBs achieved within session
+    pbs = 0
+    running_pb = float("inf")
+    # Need to check against all prior completed attempts
+    sorted_all_completed = sorted(
+        [a for a in completed], key=lambda a: a["id"]
+    )
+    for c in sorted_all_completed:
+        t = c["real_time"].total_seconds()
+        if t < running_pb:
+            pbs += 1
+            running_pb = t
+
+    return {
+        "num_attempts": n,
+        "num_completed": nc,
+        "reset_rate_pct": reset_rate,
+        "best_time": best,
+        "avg_completed_time": avg,
+        "median_completed_time": median_val,
+        "time_spent": time_spent,
+        "furthest_segment": furthest,
+        "pbs_achieved": pbs,
+    }
+
+
+def compute_session_comparisons(
+    sessions: list[dict], segments: list[dict],
+) -> pd.DataFrame:
+    """Build a summary DataFrame across sessions for the overview chart."""
+    rows = []
+    for s in sessions:
+        kpis = compute_session_kpis(s, segments)
+        completed_times = [c["real_time"].total_seconds() for c in s["completed_attempts"]]
+        std_dev = pd.Series(completed_times).std() if len(completed_times) >= 2 else None
+        rows.append({
+            "Session": s["label"],
+            "Attempts": kpis["num_attempts"],
+            "Completed": kpis["num_completed"],
+            "Completion Rate (%)": round(100 - kpis["reset_rate_pct"], 1),
+            "Best Time (s)": completed_times[0] if completed_times else None,
+            "Std Dev (s)": round(std_dev, 2) if std_dev is not None else None,
+        })
+        # Update best time to actual best
+        if completed_times:
+            rows[-1]["Best Time (s)"] = min(completed_times)
+    return pd.DataFrame(rows)
+
+
+def compute_per_split_session_comparison(
+    sessions: list[dict],
+    segments: list[dict],
+    current_idx: int,
+    compare_idx: int,
+) -> pd.DataFrame | None:
+    """Compare per-split averages between two sessions.
+
+    Returns DataFrame with columns: Segment, Current Avg (s), Compare Avg (s),
+    Delta (s), Delta (%), sorted by Delta (s).
+    Returns None if either session has no segment data.
+    """
+    current_session_attempt_ids = set(sessions[current_idx]["attempt_ids"])
+    compare_session_attempt_ids = set(sessions[compare_idx]["attempt_ids"])
+    
+    split_metrics: list[dict] = []
+    for seg in segments:
+        current_session_running_sum = 0.0
+        compare_session_running_sum = 0.0
+        current_session_running_count = 0
+        compare_session_running_count = 0
+        for attempt in seg["history"]:
+            if attempt["attempt_id"] in current_session_attempt_ids:
+                current_session_running_sum += attempt["duration"].total_seconds()
+                current_session_running_count += 1
+            if attempt["attempt_id"] in compare_session_attempt_ids:
+                compare_session_running_sum += attempt["duration"].total_seconds()
+                compare_session_running_count += 1
+        current_session_avg = (current_session_running_sum / current_session_running_count) if current_session_running_count > 0 else None
+        compare_session_avg = (compare_session_running_sum / compare_session_running_count) if compare_session_running_count > 0 else None
+
+        if current_session_avg is not None and compare_session_avg is not None:
+            delta_s = current_session_avg - compare_session_avg
+            delta_pct = (delta_s / compare_session_avg) * 100 if compare_session_avg != 0 else None
+            split_metrics.append({
+                "Segment": seg["name"],
+                "Current Avg (s)": round(current_session_avg, 2),
+                "Compare Avg (s)": round(compare_session_avg, 2),
+                "Delta (s)": round(delta_s, 2),
+                "Delta (%)": round(delta_pct, 1) if delta_pct is not None else None,
+            })
+
+    if not split_metrics:
+        return None
+    
+    return pd.DataFrame(split_metrics).sort_values(by="Delta (s)", ascending=False)
+
+
+def build_session_consistency_trend(
+    sessions: list[dict],
+) -> pd.DataFrame:
+    """Build a trend of std dev of completed times across sessions."""
+    rows = []
+    for s in sessions:
+        times = [c["real_time"].total_seconds() for c in s["completed_attempts"]]
+        if len(times) >= 2:
+            rows.append({
+                "Session": s["label"],
+                "Std Dev (s)": pd.Series(times).std(),
+            })
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
 # Balanced time goal
 # ---------------------------------------------------------------------------
 
@@ -537,8 +779,8 @@ if uploaded is not None:
     }
     total_attempts = len(all_attempt_ids)
 
-    tab_overview, tab_consistency, tab_resets, tab_goals, tab_progression = st.tabs([
-        "Overview", "Split Consistency", "Reset Analysis",
+    tab_overview, tab_sessions, tab_consistency, tab_resets, tab_goals, tab_progression = st.tabs([
+        "Overview", "Session Analysis", "Split Consistency", "Reset Analysis",
         "Balanced Goal", "PB Progression",
     ])
 
@@ -557,6 +799,206 @@ if uploaded is not None:
 
         df = pd.DataFrame(rows)
         st.dataframe(df, hide_index=True, width='stretch')
+
+    # ------------------------------------------------------------------
+    # Session Analysis
+    # ------------------------------------------------------------------
+    with tab_sessions:
+        timed_attempts = [a for a in all_attempts if a["started"] is not None]
+        excluded_count = len(all_attempts) - len(timed_attempts)
+
+        if len(timed_attempts) < 2:
+            st.info("Need at least 2 attempts with valid timestamps for session analysis.")
+        else:
+            if excluded_count > 0:
+                st.warning(f"{excluded_count} attempt(s) excluded — missing timestamps.")
+
+            # --- Controls Row ---
+            ctrl1, ctrl2, ctrl3 = st.columns(3)
+            with ctrl1:
+                grouping_mode = st.selectbox(
+                    "Grouping mode",
+                    ["Session", "Day", "Week", "Month", "Year"],
+                    key="session_grouping",
+                )
+            with ctrl2:
+                gap_threshold = 60
+                if grouping_mode == "Session":
+                    gap_threshold = st.slider(
+                        "Gap threshold (minutes)",
+                        min_value=5, max_value=480, value=60,
+                        key="session_gap",
+                    )
+
+            sessions = group_attempts_into_sessions(
+                all_attempts, attempt_history, grouping_mode, gap_threshold,
+            )
+
+            if not sessions:
+                st.info("No sessions found with the current settings.")
+            else:
+                with ctrl3:
+                    session_labels = [s["label"] for s in sessions]
+                    selected_label = st.selectbox(
+                        "Session",
+                        session_labels,
+                        index=len(session_labels) - 1,
+                        key="session_picker",
+                    )
+                current_idx = session_labels.index(selected_label)
+                current_session = sessions[current_idx]
+                kpis = compute_session_kpis(current_session, segments)
+
+                # --- KPI Cards Row 1 ---
+                def _fmt_metric(td: timedelta | None) -> str:
+                    """Format timedelta for metric cards: H:MM:SS (no ms)."""
+                    if td is None:
+                        return "-"
+                    total = int(td.total_seconds())
+                    h, rem = divmod(total, 3600)
+                    m, s = divmod(rem, 60)
+                    return f"{h}:{m:02d}:{s:02d}"
+
+                k1, k2, k3, k4 = st.columns(4)
+                if kpis["best_time"] is not None:
+                    k1.metric("Best Time", _fmt_metric(kpis["best_time"]))
+                elif kpis["furthest_segment"]:
+                    k1.metric("Furthest Reached", kpis["furthest_segment"])
+                else:
+                    k1.metric("Best Time", "-")
+                k2.metric("Runs Finished", kpis["num_completed"])
+                k3.metric("Reset Rate", f"{kpis['reset_rate_pct']:.1f}%")
+                k4.metric("Attempts", kpis["num_attempts"])
+
+                # --- KPI Cards Row 2 ---
+                k5, k6, k7, k8 = st.columns(4)
+                k5.metric("Time Spent", _fmt_metric(kpis["time_spent"]))
+                k6.metric("Avg Duration", _fmt_metric(kpis["avg_completed_time"]))
+                k7.metric("Median Duration", _fmt_metric(kpis["median_completed_time"]))
+                k8.metric("PBs Achieved", kpis["pbs_achieved"])
+
+                # --- Improvement deltas vs previous / vs first ---
+                if kpis["best_time"] is not None and len(sessions) > 1:
+                    d1, d2 = st.columns(2)
+                    if current_idx > 0:
+                        prev_kpis = compute_session_kpis(sessions[current_idx - 1], segments)
+                        if prev_kpis["best_time"] is not None:
+                            delta_prev = kpis["best_time"] - prev_kpis["best_time"]
+                            d1.metric(
+                                "vs Previous Session",
+                                _fmt_metric(kpis["best_time"]),
+                                delta=f"{delta_prev.total_seconds():+.1f}s",
+                                delta_color="inverse",
+                            )
+                        else:
+                            d1.metric("vs Previous Session", "N/A (no completions)")
+                    else:
+                        d1.metric("vs Previous Session", "N/A (first session)")
+
+                    if current_idx > 0:
+                        first_kpis = compute_session_kpis(sessions[0], segments)
+                        if first_kpis["best_time"] is not None:
+                            delta_first = kpis["best_time"] - first_kpis["best_time"]
+                            d2.metric(
+                                "vs First Session",
+                                _fmt_metric(kpis["best_time"]),
+                                delta=f"{delta_first.total_seconds():+.1f}s",
+                                delta_color="inverse",
+                            )
+                        else:
+                            d2.metric("vs First Session", "N/A (no completions)")
+                    else:
+                        d2.metric("vs First Session", "N/A (first session)")
+
+                # --- Per-Split Comparison ---
+                if len(sessions) > 1:
+                    st.markdown("#### Per-Split Comparison")
+                    compare_options = ["Previous session", "First session"] + [
+                        s["label"] for s in sessions if s["label"] != selected_label
+                    ]
+                    compare_choice = st.selectbox(
+                        "Compare against", compare_options, key="session_compare",
+                    )
+                    if compare_choice == "Previous session":
+                        compare_idx = max(0, current_idx - 1)
+                    elif compare_choice == "First session":
+                        compare_idx = 0
+                    else:
+                        compare_idx = session_labels.index(compare_choice)
+
+                    if current_idx != compare_idx:
+                        split_df = compute_per_split_session_comparison(
+                            sessions, segments, current_idx, compare_idx,
+                        )
+                        if split_df is not None and not split_df.empty:
+                            st.dataframe(split_df, hide_index=True, width="stretch")
+
+                            top_improved = split_df.nsmallest(3, "Delta (s)")
+                            top_regressed = split_df.nlargest(3, "Delta (s)")
+                            imp_col, reg_col = st.columns(2)
+                            with imp_col:
+                                st.markdown("**Top 3 Improved**")
+                                for _, row in top_improved.iterrows():
+                                    if row["Delta (s)"] < 0:
+                                        st.write(f"- {row['Segment']}: {row['Delta (s)']:+.2f}s ({row['Delta (%)']:+.1f}%)")
+                            with reg_col:
+                                st.markdown("**Top 3 Regressed**")
+                                for _, row in top_regressed.iterrows():
+                                    if row["Delta (s)"] > 0:
+                                        st.write(f"- {row['Segment']}: {row['Delta (s)']:+.2f}s ({row['Delta (%)']:+.1f}%)")
+                        else:
+                            st.info("Not enough segment data to compare these sessions.")
+                    else:
+                        st.info("Select a different session to compare against.")
+
+                # --- Consistency Trend ---
+                consistency_df = build_session_consistency_trend(sessions)
+                if not consistency_df.empty:
+                    st.markdown("#### Consistency Trend")
+                    consist_chart = alt.Chart(consistency_df).mark_line(point=True).encode(
+                        x=alt.X("Session:N", sort=session_labels, title="Session"),
+                        y=alt.Y("Std Dev (s):Q", title="Std Dev of Completed Times (s)"),
+                        tooltip=["Session", "Std Dev (s)"],
+                    ).interactive()
+                    st.altair_chart(consist_chart, use_container_width=True)
+
+                # --- Sessions Overview Chart ---
+                overview_df = compute_session_comparisons(sessions, segments)
+                if not overview_df.empty:
+                    st.markdown("#### Sessions Overview")
+
+                    hover = alt.selection_point(on="pointerover", empty=False)
+
+                    bars = alt.Chart(overview_df).mark_bar().encode(
+                        x=alt.X("Session:N", sort=session_labels, title="Session"),
+                        y=alt.Y("Attempts:Q", title="Attempts"),
+                        color=alt.Color(
+                            "Completion Rate (%):Q",
+                            scale=alt.Scale(scheme="redyellowgreen", domain=[0, 100]),
+                            title="Completion %",
+                        ),
+                        tooltip=["Session", "Attempts", "Completed", "Completion Rate (%)"],
+                        opacity=alt.condition(hover, alt.value(1), alt.value(0.7)),
+                    ).add_params(hover)
+
+                    best_times = overview_df.dropna(subset=["Best Time (s)"])
+                    if not best_times.empty:
+                        line = alt.Chart(best_times).mark_line(
+                            color="steelblue", point=True, strokeWidth=2,
+                        ).encode(
+                            x=alt.X("Session:N", sort=session_labels),
+                            y=alt.Y("Best Time (s):Q", title="Best Time (s)"),
+                            tooltip=[
+                                "Session",
+                                alt.Tooltip("Best Time (s):Q", format=".1f"),
+                            ],
+                        )
+                        combined_chart = alt.layer(bars, line).resolve_scale(
+                            y="independent",
+                        )
+                        st.altair_chart(combined_chart, use_container_width=True)
+                    else:
+                        st.altair_chart(bars, use_container_width=True)
 
     # ------------------------------------------------------------------
     # Split Consistency
