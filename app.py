@@ -531,319 +531,326 @@ if uploaded is not None:
     st.caption(f"Attempts: {run_info['attempts']}")
 
     durations = compute_segment_durations(segments)
-
-    rows = []
-    for seg, dur in zip(segments, durations):
-        rows.append({
-            "Segment": seg["name"],
-            "PB Split": format_time(seg["pb_split"]),
-            "PB Segment Duration": format_time(dur),
-            "Best Segment": format_time(seg["best_segment"]),
-        })
-
-    df = pd.DataFrame(rows)
-    st.dataframe(df, hide_index=True, width='stretch')
-
-    # ------------------------------------------------------------------
-    # Split consistency boxplot
-    # ------------------------------------------------------------------
-    all_attempt_ids: set[int] = set()
-    for seg in segments:
-        for h in seg["history"]:
-            all_attempt_ids.add(h["attempt_id"])
+    segment_order = [seg["name"] for seg in segments]
+    all_attempt_ids: set[int] = {
+        h["attempt_id"] for seg in segments for h in seg["history"]
+    }
     total_attempts = len(all_attempt_ids)
 
-    if total_attempts >= 2:
-        st.subheader("Split Consistency")
-
-        n_attempts = st.slider(
-            "Recent attempts to include",
-            min_value=2,
-            max_value=total_attempts,
-            value=min(20, total_attempts),
-        )
-
-        hist_df = build_history_df(segments, n_attempts)
-
-        if not hist_df.empty:
-            segment_order = [seg["name"] for seg in segments]
-            chart = alt.Chart(hist_df).mark_boxplot().encode(
-                alt.X("Segment", sort=segment_order),
-                alt.Y("Duration (s)"),
-            )
-            st.altair_chart(chart, width='stretch')
-
-            # ----------------------------------------------------------
-            # Top 5 splits that need training
-            # ----------------------------------------------------------
-            training_targets = rank_splits_for_training(hist_df)
-            if training_targets is not None and not training_targets.empty:
-                st.markdown("#### Splits to Train")
-                st.dataframe(
-                    training_targets.head(5),
-                    hide_index=True,
-                    width='stretch',
-                )
-        else:
-            st.info("No segment history data available for the selected attempts.")
+    tab_overview, tab_consistency, tab_resets, tab_goals, tab_progression = st.tabs([
+        "Overview", "Split Consistency", "Reset Analysis",
+        "Balanced Goal", "PB Progression",
+    ])
 
     # ------------------------------------------------------------------
-    # Reset Analysis
+    # Overview
     # ------------------------------------------------------------------
-    if all_attempts and len(all_attempts) >= 2:
-        st.subheader("Reset Analysis")
+    with tab_overview:
+        rows = []
+        for seg, dur in zip(segments, durations):
+            rows.append({
+                "Segment": seg["name"],
+                "PB Split": format_time(seg["pb_split"]),
+                "PB Segment Duration": format_time(dur),
+                "Best Segment": format_time(seg["best_segment"]),
+            })
 
-        total_count = len(all_attempts)
-        completed_count = sum(1 for a in all_attempts if a["completed"])
-        reset_count = total_count - completed_count
-        completion_pct = (completed_count / total_count) * 100 if total_count else 0
-        reset_pct = 100 - completion_pct
-
-        # KPI row
-        kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-        kpi1.metric("Total Attempts", total_count)
-        kpi2.metric("Completed", completed_count)
-        kpi3.metric("Completion Rate", f"{completion_pct:.1f}%")
-        kpi4.metric("Reset Rate", f"{reset_pct:.1f}%")
-
-        # Streak row
-        streaks = compute_reset_streaks(all_attempts)
-        if streaks is not None:
-            longest_streak, current_streak = streaks
-            s1, s2 = st.columns(2)
-            s1.metric("Longest Reset Streak", longest_streak)
-            s2.metric("Current Reset Streak", current_streak)
-
-        # Reset location bar chart
-        reset_df = find_reset_locations(segments, all_attempts)
-        if not reset_df.empty:
-            segment_order = [seg["name"] for seg in segments]
-            reset_counts = reset_df.groupby("reset_segment").size().reset_index(name="Resets")
-            reset_counts.columns = ["Segment", "Resets"]
-
-            reset_mode = st.toggle("Show as Reset Chance (%)", key="reset_chart_mode")
-
-            if reset_mode:
-                # Times played = completed runs + resets at this segment or later
-                seg_index = {name: i for i, name in enumerate(segment_order)}
-                resets_by_idx = {seg_index[row["Segment"]]: row["Resets"]
-                                 for _, row in reset_counts.iterrows()
-                                 if row["Segment"] in seg_index}
-                chart_rows = []
-                # Cumulative resets from the end: segments at index >= i
-                resets_at_or_after = 0
-                for i in range(len(segment_order) - 1, -1, -1):
-                    resets_at_or_after += resets_by_idx.get(i, 0)
-                    times_played = completed_count + resets_at_or_after
-                    seg_resets = resets_by_idx.get(i, 0)
-                    chance = (seg_resets / times_played) * 100 if times_played else 0
-                    chart_rows.append({
-                        "Segment": segment_order[i],
-                        "Reset Chance (%)": round(chance, 1),
-                    })
-                chart_df = pd.DataFrame(chart_rows)
-                hover = alt.selection_point(on="pointerover", empty=False)
-                reset_chart = alt.Chart(chart_df).mark_bar().encode(
-                    x=alt.X("Segment:N", sort=segment_order, title="Segment"),
-                    y=alt.Y("Reset Chance (%):Q", title="Reset Chance (%)"),
-                    tooltip=["Segment", "Reset Chance (%)"],
-                    opacity=alt.condition(hover, alt.value(1), alt.value(0.7)),
-                ).add_params(hover)
-            else:
-                hover = alt.selection_point(on="pointerover", empty=False)
-                reset_chart = alt.Chart(reset_counts).mark_bar().encode(
-                    x=alt.X("Segment:N", sort=segment_order, title="Segment"),
-                    y=alt.Y("Resets:Q", title="Reset Count"),
-                    tooltip=["Segment", "Resets"],
-                    opacity=alt.condition(hover, alt.value(1), alt.value(0.7)),
-                ).add_params(hover)
-
-            st.altair_chart(reset_chart, use_container_width=True)
-
-        # Completion rate trend
-        window = st.slider(
-            "Rolling window size",
-            min_value=5,
-            max_value=max(10, total_count),
-            value=min(20, total_count),
-            key="reset_window",
-        )
-        trend_df = build_completion_trend(all_attempts, window)
-        trend_chart = alt.Chart(trend_df).mark_line(point=True).encode(
-            x=alt.X("Attempt:Q", title="Attempt #"),
-            y=alt.Y("Completion Rate (%):Q", scale=alt.Scale(domain=[0, 100])),
-            tooltip=["Attempt", "Completion Rate (%)"],
-        ).interactive()
-        st.altair_chart(trend_chart, use_container_width=True)
+        df = pd.DataFrame(rows)
+        st.dataframe(df, hide_index=True, width='stretch')
 
     # ------------------------------------------------------------------
-    # Balanced Time Goal
+    # Split Consistency
     # ------------------------------------------------------------------
-    sob = compute_sum_of_best(segments)
-    pb_total = segments[-1]["pb_split"] if segments and segments[-1]["pb_split"] else None
-
-    if sob is not None and pb_total is not None and total_attempts >= 2:
-        st.subheader("Balanced Time Goal")
-
-        bal_col1, bal_col2 = st.columns(2)
-        with bal_col1:
-            n_bal_attempts = st.slider(
+    with tab_consistency:
+        if total_attempts >= 2:
+            n_attempts = st.slider(
                 "Recent attempts to include",
                 min_value=2,
                 max_value=total_attempts,
                 value=min(20, total_attempts),
-                key="balanced_attempts",
-            )
-        with bal_col2:
-            aggressiveness = st.slider(
-                "Aggressiveness (0 = PB, 1 = Sum of Best)",
-                min_value=0.0,
-                max_value=1.0,
-                value=0.5,
-                step=0.05,
             )
 
-        bal_hist_df = build_history_df(segments, n_bal_attempts)
+            hist_df = build_history_df(segments, n_attempts)
 
-        if not bal_hist_df.empty:
-            balanced = compute_balanced_segments(
-                segments, durations, bal_hist_df, aggressiveness,
+            if not hist_df.empty:
+                chart = alt.Chart(hist_df).mark_boxplot().encode(
+                    alt.X("Segment", sort=segment_order),
+                    alt.Y("Duration (s)"),
+                )
+                st.altair_chart(chart, width='stretch')
+
+                training_targets = rank_splits_for_training(hist_df)
+                if training_targets is not None and not training_targets.empty:
+                    st.markdown("#### Splits to Train")
+                    st.dataframe(
+                        training_targets.head(5),
+                        hide_index=True,
+                        width='stretch',
+                    )
+            else:
+                st.info("No segment history data available for the selected attempts.")
+        else:
+            st.info("Need at least 2 attempts for consistency analysis.")
+
+    # ------------------------------------------------------------------
+    # Reset Analysis
+    # ------------------------------------------------------------------
+    with tab_resets:
+        if all_attempts and len(all_attempts) >= 2:
+            total_count = len(all_attempts)
+            completed_count = sum(1 for a in all_attempts if a["completed"])
+            reset_count = total_count - completed_count
+            completion_pct = (completed_count / total_count) * 100 if total_count else 0
+            reset_pct = 100 - completion_pct
+
+            # KPI row
+            kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+            kpi1.metric("Total Attempts", total_count)
+            kpi2.metric("Completed", completed_count)
+            kpi3.metric("Completion Rate", f"{completion_pct:.1f}%")
+            kpi4.metric("Reset Rate", f"{reset_pct:.1f}%")
+
+            # Streak row
+            streaks = compute_reset_streaks(all_attempts)
+            if streaks is not None:
+                longest_streak, current_streak = streaks
+                s1, s2 = st.columns(2)
+                s1.metric("Longest Reset Streak", longest_streak)
+                s2.metric("Current Reset Streak", current_streak)
+
+            # Reset location bar chart
+            reset_df = find_reset_locations(segments, all_attempts)
+            if not reset_df.empty:
+                reset_counts = reset_df.groupby("reset_segment").size().reset_index(name="Resets")
+                reset_counts.columns = ["Segment", "Resets"]
+
+                reset_mode = st.toggle("Show as Reset Chance (%)", key="reset_chart_mode")
+
+                if reset_mode:
+                    # Times played = completed runs + resets at this segment or later
+                    seg_index = {name: i for i, name in enumerate(segment_order)}
+                    resets_by_idx = {seg_index[row["Segment"]]: row["Resets"]
+                                     for _, row in reset_counts.iterrows()
+                                     if row["Segment"] in seg_index}
+                    chart_rows = []
+                    # Cumulative resets from the end: segments at index >= i
+                    resets_at_or_after = 0
+                    for i in range(len(segment_order) - 1, -1, -1):
+                        resets_at_or_after += resets_by_idx.get(i, 0)
+                        times_played = completed_count + resets_at_or_after
+                        seg_resets = resets_by_idx.get(i, 0)
+                        chance = (seg_resets / times_played) * 100 if times_played else 0
+                        chart_rows.append({
+                            "Segment": segment_order[i],
+                            "Reset Chance (%)": round(chance, 1),
+                        })
+                    chart_df = pd.DataFrame(chart_rows)
+                    hover = alt.selection_point(on="pointerover", empty=False)
+                    reset_chart = alt.Chart(chart_df).mark_bar().encode(
+                        x=alt.X("Segment:N", sort=segment_order, title="Segment"),
+                        y=alt.Y("Reset Chance (%):Q", title="Reset Chance (%)"),
+                        tooltip=["Segment", "Reset Chance (%)"],
+                        opacity=alt.condition(hover, alt.value(1), alt.value(0.7)),
+                    ).add_params(hover)
+                else:
+                    hover = alt.selection_point(on="pointerover", empty=False)
+                    reset_chart = alt.Chart(reset_counts).mark_bar().encode(
+                        x=alt.X("Segment:N", sort=segment_order, title="Segment"),
+                        y=alt.Y("Resets:Q", title="Reset Count"),
+                        tooltip=["Segment", "Resets"],
+                        opacity=alt.condition(hover, alt.value(1), alt.value(0.7)),
+                    ).add_params(hover)
+
+                st.altair_chart(reset_chart, use_container_width=True)
+
+            # Completion rate trend
+            window = st.slider(
+                "Rolling window size",
+                min_value=5,
+                max_value=max(10, total_count),
+                value=min(20, total_count),
+                key="reset_window",
             )
+            trend_df = build_completion_trend(all_attempts, window)
+            trend_chart = alt.Chart(trend_df).mark_line(point=True).encode(
+                x=alt.X("Attempt:Q", title="Attempt #"),
+                y=alt.Y("Completion Rate (%):Q", scale=alt.Scale(domain=[0, 100])),
+                tooltip=["Attempt", "Completion Rate (%)"],
+            ).interactive()
+            st.altair_chart(trend_chart, use_container_width=True)
+        else:
+            st.info("Need at least 2 attempts for reset analysis.")
 
-            if balanced and any(b is not None for b in balanced):
-                cumulative = timedelta()
-                goal_rows = []
-                for seg, dur, bal in zip(segments, durations, balanced):
-                    if bal is not None:
-                        cumulative += bal
-                    goal_rows.append({
-                        "Segment": seg["name"],
-                        "Best Segment": format_time(seg["best_segment"]),
-                        "PB Segment": format_time(dur),
-                        "Balanced Segment": format_time(bal),
-                        "Balanced Split": format_time(
-                            cumulative if bal is not None else None
-                        ),
-                    })
+    # ------------------------------------------------------------------
+    # Balanced Time Goal
+    # ------------------------------------------------------------------
+    with tab_goals:
+        sob = compute_sum_of_best(segments)
+        pb_total = segments[-1]["pb_split"] if segments and segments[-1]["pb_split"] else None
 
-                st.metric("Balanced Goal Time", format_time(cumulative))
-                met_col1, met_col2 = st.columns(2)
-                met_col1.metric("Sum of Best", format_time(sob))
-                met_col2.metric("Personal Best", format_time(pb_total))
-
-                st.dataframe(
-                    pd.DataFrame(goal_rows), hide_index=True, width='stretch',
+        if sob is not None and pb_total is not None and total_attempts >= 2:
+            bal_col1, bal_col2 = st.columns(2)
+            with bal_col1:
+                n_bal_attempts = st.slider(
+                    "Recent attempts to include",
+                    min_value=2,
+                    max_value=total_attempts,
+                    value=min(20, total_attempts),
+                    key="balanced_attempts",
+                )
+            with bal_col2:
+                aggressiveness = st.slider(
+                    "Aggressiveness (0 = PB, 1 = Sum of Best)",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=0.5,
+                    step=0.05,
                 )
 
-                # Build cumulative split list for export
-                cum = timedelta()
-                cumulative_splits: list[timedelta | None] = []
-                for bal in balanced:
-                    if bal is not None:
-                        cum += bal
-                        cumulative_splits.append(cum)
-                    else:
-                        cumulative_splits.append(None)
+            bal_hist_df = build_history_df(segments, n_bal_attempts)
 
-                modified_lss = inject_balanced_comparison(
-                    uploaded.getvalue(), cumulative_splits,
+            if not bal_hist_df.empty:
+                balanced = compute_balanced_segments(
+                    segments, durations, bal_hist_df, aggressiveness,
                 )
 
-                base_name = uploaded.name.rsplit(".", 1)[0]
-                st.download_button(
-                    label="Download .lss with Balanced Goal",
-                    data=modified_lss,
-                    file_name=f"{base_name}_balanced.lss",
-                    mime="application/xml",
-                )
+                if balanced and any(b is not None for b in balanced):
+                    cumulative = timedelta()
+                    goal_rows = []
+                    for seg, dur, bal in zip(segments, durations, balanced):
+                        if bal is not None:
+                            cumulative += bal
+                        goal_rows.append({
+                            "Segment": seg["name"],
+                            "Best Segment": format_time(seg["best_segment"]),
+                            "PB Segment": format_time(dur),
+                            "Balanced Segment": format_time(bal),
+                            "Balanced Split": format_time(
+                                cumulative if bal is not None else None
+                            ),
+                        })
+
+                    st.metric("Balanced Goal Time", format_time(cumulative))
+                    met_col1, met_col2 = st.columns(2)
+                    met_col1.metric("Sum of Best", format_time(sob))
+                    met_col2.metric("Personal Best", format_time(pb_total))
+
+                    st.dataframe(
+                        pd.DataFrame(goal_rows), hide_index=True, width='stretch',
+                    )
+
+                    # Build cumulative split list for export
+                    cum = timedelta()
+                    cumulative_splits: list[timedelta | None] = []
+                    for bal in balanced:
+                        if bal is not None:
+                            cum += bal
+                            cumulative_splits.append(cum)
+                        else:
+                            cumulative_splits.append(None)
+
+                    modified_lss = inject_balanced_comparison(
+                        uploaded.getvalue(), cumulative_splits,
+                    )
+
+                    base_name = uploaded.name.rsplit(".", 1)[0]
+                    st.download_button(
+                        label="Download .lss with Balanced Goal",
+                        data=modified_lss,
+                        file_name=f"{base_name}_balanced.lss",
+                        mime="application/xml",
+                    )
+        else:
+            st.info("Need a PB, Sum of Best, and at least 2 attempts for balanced goals.")
 
     # ------------------------------------------------------------------
     # PB & Sum of Best Progression
     # ------------------------------------------------------------------
-    pb_df = build_pb_progression(attempt_history) if attempt_history else pd.DataFrame()
-    sob_df = build_sob_progression(segments)
+    with tab_progression:
+        pb_df = build_pb_progression(attempt_history) if attempt_history else pd.DataFrame()
+        sob_df = build_sob_progression(segments)
 
-    has_pb = not pb_df.empty and pb_df["Is New PB"].any()
-    has_sob = not sob_df.empty and sob_df["Is New SOB"].any()
+        has_pb = not pb_df.empty and pb_df["Is New PB"].any()
+        has_sob = not sob_df.empty and sob_df["Is New SOB"].any()
 
-    if has_pb or has_sob:
-        st.subheader("PB & Sum of Best Progression")
+        if has_pb or has_sob:
+            combined_rows: list[pd.DataFrame] = []
 
-        combined_rows: list[pd.DataFrame] = []
+            if has_pb:
+                pb_points = pb_df[pb_df["Is New PB"]].copy()
+                combined_rows.append(pd.DataFrame({
+                    "Attempt": pb_points["Attempt"],
+                    "Time (s)": pb_points["PB (s)"],
+                    "Formatted": pb_points["PB (s)"].apply(
+                        lambda s: format_time(timedelta(seconds=s))
+                    ),
+                    "Series": "PB",
+                }))
 
-        if has_pb:
-            pb_points = pb_df[pb_df["Is New PB"]].copy()
-            combined_rows.append(pd.DataFrame({
-                "Attempt": pb_points["Attempt"],
-                "Time (s)": pb_points["PB (s)"],
-                "Formatted": pb_points["PB (s)"].apply(
-                    lambda s: format_time(timedelta(seconds=s))
-                ),
-                "Series": "PB",
-            }))
+            if has_sob:
+                sob_points = sob_df[sob_df["Is New SOB"]].copy()
+                combined_rows.append(pd.DataFrame({
+                    "Attempt": sob_points["Attempt"],
+                    "Time (s)": sob_points["SOB (s)"],
+                    "Formatted": sob_points["SOB (s)"].apply(
+                        lambda s: format_time(timedelta(seconds=s))
+                    ),
+                    "Series": "SOB",
+                }))
 
-        if has_sob:
-            sob_points = sob_df[sob_df["Is New SOB"]].copy()
-            combined_rows.append(pd.DataFrame({
-                "Attempt": sob_points["Attempt"],
-                "Time (s)": sob_points["SOB (s)"],
-                "Formatted": sob_points["SOB (s)"].apply(
-                    lambda s: format_time(timedelta(seconds=s))
-                ),
-                "Series": "SOB",
-            }))
+            combined = pd.concat(combined_rows, ignore_index=True)
 
-        combined = pd.concat(combined_rows, ignore_index=True)
+            min_attempt = int(combined["Attempt"].min())
+            max_attempt = int(combined["Attempt"].max())
 
-        min_attempt = int(combined["Attempt"].min())
-        max_attempt = int(combined["Attempt"].max())
+            if max_attempt - min_attempt > 1:
+                attempt_range = st.slider(
+                    "Attempt range",
+                    min_value=min_attempt,
+                    max_value=max_attempt,
+                    value=(min_attempt, max_attempt),
+                    key="progression_attempt_range",
+                )
+                combined = combined[
+                    (combined["Attempt"] >= attempt_range[0])
+                    & (combined["Attempt"] <= attempt_range[1])
+                ]
 
-        if max_attempt - min_attempt > 1:
-            attempt_range = st.slider(
-                "Attempt range",
-                min_value=min_attempt,
-                max_value=max_attempt,
-                value=(min_attempt, max_attempt),
-                key="progression_attempt_range",
-            )
-            combined = combined[
-                (combined["Attempt"] >= attempt_range[0])
-                & (combined["Attempt"] <= attempt_range[1])
-            ]
+            chart = alt.Chart(combined).mark_line(
+                point=True,
+                interpolate="step-after",
+            ).encode(
+                x=alt.X("Attempt:Q", title="Attempt #"),
+                y=alt.Y("Time (s):Q", title="Time (seconds)", scale=alt.Scale(zero=False)),
+                color=alt.Color("Series:N", title="Series"),
+                tooltip=[
+                    alt.Tooltip("Attempt:Q", title="Attempt"),
+                    alt.Tooltip("Formatted:N", title="Time"),
+                    alt.Tooltip("Series:N", title="Series"),
+                ],
+            ).interactive()
 
-        chart = alt.Chart(combined).mark_line(
-            point=True,
-            interpolate="step-after",
-        ).encode(
-            x=alt.X("Attempt:Q", title="Attempt #"),
-            y=alt.Y("Time (s):Q", title="Time (seconds)", scale=alt.Scale(zero=False)),
-            color=alt.Color("Series:N", title="Series"),
-            tooltip=[
-                alt.Tooltip("Attempt:Q", title="Attempt"),
-                alt.Tooltip("Formatted:N", title="Time"),
-                alt.Tooltip("Series:N", title="Series"),
-            ],
-        ).interactive()
+            st.altair_chart(chart, use_container_width=True)
 
-        st.altair_chart(chart, use_container_width=True)
-
-        caption_parts: list[str] = []
-        if has_pb:
-            pb_pts = pb_df[pb_df["Is New PB"]]
-            first_pb = pb_pts.iloc[0]["PB (s)"]
-            current_pb = pb_pts.iloc[-1]["PB (s)"]
-            caption_parts.append(
-                f"PB: {format_time(timedelta(seconds=current_pb))} "
-                f"({len(pb_pts)} PBs, "
-                f"{format_time(timedelta(seconds=first_pb - current_pb))} improvement)"
-            )
-        if has_sob:
-            sob_pts = sob_df[sob_df["Is New SOB"]]
-            first_sob = sob_pts.iloc[0]["SOB (s)"]
-            current_sob = sob_pts.iloc[-1]["SOB (s)"]
-            caption_parts.append(
-                f"SOB: {format_time(timedelta(seconds=current_sob))} "
-                f"({len(sob_pts)} improvements, "
-                f"{format_time(timedelta(seconds=first_sob - current_sob))} improvement)"
-            )
-        st.caption(" | ".join(caption_parts))
+            caption_parts: list[str] = []
+            if has_pb:
+                pb_pts = pb_df[pb_df["Is New PB"]]
+                first_pb = pb_pts.iloc[0]["PB (s)"]
+                current_pb = pb_pts.iloc[-1]["PB (s)"]
+                caption_parts.append(
+                    f"PB: {format_time(timedelta(seconds=current_pb))} "
+                    f"({len(pb_pts)} PBs, "
+                    f"{format_time(timedelta(seconds=first_pb - current_pb))} improvement)"
+                )
+            if has_sob:
+                sob_pts = sob_df[sob_df["Is New SOB"]]
+                first_sob = sob_pts.iloc[0]["SOB (s)"]
+                current_sob = sob_pts.iloc[-1]["SOB (s)"]
+                caption_parts.append(
+                    f"SOB: {format_time(timedelta(seconds=current_sob))} "
+                    f"({len(sob_pts)} improvements, "
+                    f"{format_time(timedelta(seconds=first_sob - current_sob))} improvement)"
+                )
+            st.caption(" | ".join(caption_parts))
+        else:
+            st.info("No PB or Sum of Best progression data available.")
